@@ -33,7 +33,18 @@ func main() {
 	token := flag.String("token", "", "Agent Token (required for install)")
 	server := flag.String("server", "localhost:50051", "Server Address (for install)")
 	secure := flag.Bool("secure", false, "Use secure connection (for install)")
+	logFile := flag.String("logfile", "", "Log file path (optional, default: stdout)")
 	flag.Parse()
+
+	// Setup logging to file if specified
+	if *logFile != "" {
+		f, err := os.OpenFile(*logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			log.Fatalf("Failed to open log file: %v", err)
+		}
+		defer f.Close()
+		log.SetOutput(f)
+	}
 
 	if *install {
 		runInstall(*token, *server, *secure)

@@ -3,7 +3,7 @@
 Agen pemantauan jaringan ringan (Lightweight Network Monitoring Agent) untuk menjalankan instruksi Ping & MTR.
 
 ## Persyaratan Sistem
-- **Sistem Operasi**: Linux (Server/Desktop) atau macOS.
+- **Sistem Operasi**: Linux, FreeBSD (Server/Desktop) atau macOS.
 - **Jaringan**: Koneksi internet yang stabil.
 - **Hak Akses**: Akses **Root / Sudo** wajib diperlukan karena agen menggunakan *Raw Socket* untuk melakukan eksekusi ICMP Ping yang akurat.
 
