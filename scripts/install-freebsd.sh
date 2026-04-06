@@ -95,6 +95,12 @@ fi
 chmod +x /usr/local/etc/cekping-agent/cekping-agent
 
 echo "Creating FreeBSD rc.d service..."
+
+# Check folder rc.d are available
+if [ ! -d "/usr/local/etc/rc.d" ]; then
+        mkdir -p "/usr/local/etc/rc.d"
+fi
+
 cat <<'EOF' > /usr/local/etc/rc.d/cekping-agent
 #!/bin/sh
 

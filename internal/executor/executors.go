@@ -10,9 +10,14 @@ import (
 
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 )
 
 var icmpIDCounter uint32 = uint32(time.Now().UnixNano() & 0xffff)
+
+func isIPv6(ip net.IP) bool {
+	return ip.To4() == nil
+}
 
 type PingStats struct {
 	Min, Max, Avg, StdDev float64
@@ -22,13 +27,26 @@ type PingStats struct {
 
 func DoPing(ctx context.Context, target string, count int, onPacket func(seq, ttl int, rtt float64)) (*PingStats, error) {
 	// 1. Resolve Target
-	dst, err := net.ResolveIPAddr("ip4", target)
+	dst, err := net.ResolveIPAddr("ip", target)
 	if err != nil {
 		return nil, err
 	}
 
+	isV6 := isIPv6(dst.IP)
+	network := "ip4:icmp"
+	listenAddr := "0.0.0.0"
+	protocol := 1 // ICMPv4
+	echoType := icmp.Type(ipv4.ICMPTypeEcho)
+
+	if isV6 {
+		network = "ip6:ipv6-icmp"
+		listenAddr = "::"
+		protocol = 58 // ICMPv6
+		echoType = icmp.Type(ipv6.ICMPTypeEchoRequest)
+	}
+
 	// 2. Open PacketConn (ICMP)
-	c, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
+	c, err := icmp.ListenPacket(network, listenAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -54,7 +72,7 @@ func DoPing(ctx context.Context, target string, count int, onPacket func(seq, tt
 		}
 		// Construct Message
 		wm := icmp.Message{
-			Type: ipv4.ICMPTypeEcho, Code: 0,
+			Type: echoType, Code: 0,
 			Body: &icmp.Echo{
 				ID: id, Seq: seq,
 				Data: []byte("Cekping-Ping"),
@@ -90,12 +108,20 @@ func DoPing(ctx context.Context, target string, count int, onPacket func(seq, tt
 			}
 
 			// Parse Reply
-			rm, err := icmp.ParseMessage(1, rb[:n])
+			rm, err := icmp.ParseMessage(protocol, rb[:n])
 			if err != nil {
 				continue // Ignore parse failures, wait for next packet
 			}
 
-			if rm.Type == ipv4.ICMPTypeEchoReply {
+			// Check for echo reply (IPv4 or IPv6)
+			isReply := false
+			if !isV6 && rm.Type == ipv4.ICMPTypeEchoReply {
+				isReply = true
+			} else if isV6 && rm.Type == ipv6.ICMPTypeEchoReply {
+				isReply = true
+			}
+
+			if isReply {
 				if echo, ok := rm.Body.(*icmp.Echo); ok {
 					if echo.ID == id && echo.Seq == seq {
 						// Success! We found our specific packet
@@ -164,13 +190,26 @@ type MTRHopStats struct {
 
 func DoMTR(ctx context.Context, target string, count int, onHop func(MTRHopStats)) error {
 	// 1. Resolve Target
-	dst, err := net.ResolveIPAddr("ip4", target)
+	dst, err := net.ResolveIPAddr("ip", target)
 	if err != nil {
 		return err
 	}
 
+	isV6 := isIPv6(dst.IP)
+	network := "ip4:icmp"
+	listenAddr := "0.0.0.0"
+	protocol := 1 // ICMPv4
+	echoType := icmp.Type(ipv4.ICMPTypeEcho)
+
+	if isV6 {
+		network = "ip6:ipv6-icmp"
+		listenAddr = "::"
+		protocol = 58 // ICMPv6
+		echoType = icmp.Type(ipv6.ICMPTypeEchoRequest)
+	}
+
 	// 2. Open PacketConn (ICMP)
-	c, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
+	c, err := icmp.ListenPacket(network, listenAddr)
 	if err != nil {
 		return err
 	}
@@ -209,7 +248,7 @@ func DoMTR(ctx context.Context, target string, count int, onHop func(MTRHopStats
 
 			// Construct Message
 			wm := icmp.Message{
-				Type: ipv4.ICMPTypeEcho, Code: 0,
+				Type: echoType, Code: 0,
 				Body: &icmp.Echo{
 					ID: id, Seq: (seq << 8) | ttl, // Encode cycle & ttl in seq? Or just use global seq
 					Data: []byte("Cekping-MTR"),
@@ -220,11 +259,20 @@ func DoMTR(ctx context.Context, target string, count int, onHop func(MTRHopStats
 				continue
 			}
 
-			// Set TTL
-			pConn := c.IPv4PacketConn()
-			if pConn != nil {
-				if err := pConn.SetTTL(ttl); err != nil {
-					log.Printf("MTR Error setting TTL: %v", err)
+			// Set TTL / Hop Limit
+			if !isV6 {
+				pConn := c.IPv4PacketConn()
+				if pConn != nil {
+					if err := pConn.SetTTL(ttl); err != nil {
+						log.Printf("MTR Error setting TTL: %v", err)
+					}
+				}
+			} else {
+				pConn := c.IPv6PacketConn()
+				if pConn != nil {
+					if err := pConn.SetHopLimit(ttl); err != nil {
+						log.Printf("MTR Error setting Hop Limit: %v", err)
+					}
 				}
 			}
 
@@ -252,35 +300,55 @@ func DoMTR(ctx context.Context, target string, count int, onHop func(MTRHopStats
 				}
 
 				// Parse Reply
-				rm, err := icmp.ParseMessage(1, rb[:n])
+				rm, err := icmp.ParseMessage(protocol, rb[:n])
 				if err != nil {
 					continue // Corrupt packet: wait for another
 				}
 
 				// Check Type
 				isReply := false
-				switch rm.Type {
-				case ipv4.ICMPTypeTimeExceeded:
-					// Strict filter: Check if the encapsulated original packet matches our MTR packet
-					if timeExceeded, ok := rm.Body.(*icmp.TimeExceeded); ok {
-						if len(timeExceeded.Data) >= 28 { // IPv4 header (20) + ICMP header (8)
-							// Extract inner ICMP Identifier (bytes 24-25 in total data)
-							innerID := int(timeExceeded.Data[24])<<8 | int(timeExceeded.Data[25])
-							if innerID != id {
-								continue // Not our packet
+				isValidTimeExceeded := false
+
+				if !isV6 {
+					if rm.Type == ipv4.ICMPTypeTimeExceeded {
+						if timeExceeded, ok := rm.Body.(*icmp.TimeExceeded); ok {
+							if len(timeExceeded.Data) >= 28 { // IPv4 header (20) + ICMP header (8)
+								innerID := int(timeExceeded.Data[24])<<8 | int(timeExceeded.Data[25])
+								if innerID == id {
+									isValidTimeExceeded = true
+								}
+							}
+						}
+					} else if rm.Type == ipv4.ICMPTypeEchoReply {
+						if echo, ok := rm.Body.(*icmp.Echo); ok {
+							if echo.ID == id && echo.Seq == ((seq<<8)|ttl) {
+								isReply = true
 							}
 						}
 					}
-					// Valid Hop response
-				case ipv4.ICMPTypeEchoReply:
-					if echo, ok := rm.Body.(*icmp.Echo); ok {
-						if echo.ID != id || echo.Seq != ((seq<<8)|ttl) {
-							continue // Not our specific echo reply
+				} else {
+					if rm.Type == ipv6.ICMPTypeTimeExceeded {
+						if timeExceeded, ok := rm.Body.(*icmp.TimeExceeded); ok {
+							// For IPv6, the data contains the invoking packet (IPv6 header + ICMPv6 header)
+							// IPv6 header is 40 bytes. ICMPv6 header is 8 bytes.
+							if len(timeExceeded.Data) >= 48 {
+								// Extract inner ICMPv6 Identifier (bytes 44-45 in total data)
+								innerID := int(timeExceeded.Data[44])<<8 | int(timeExceeded.Data[45])
+								if innerID == id {
+									isValidTimeExceeded = true
+								}
+							}
+						}
+					} else if rm.Type == ipv6.ICMPTypeEchoReply {
+						if echo, ok := rm.Body.(*icmp.Echo); ok {
+							if echo.ID == id && echo.Seq == ((seq<<8)|ttl) {
+								isReply = true
+							}
 						}
 					}
-					isReply = true
-				default:
-					// Ignore others
+				}
+
+				if !isReply && !isValidTimeExceeded {
 					continue
 				}
 

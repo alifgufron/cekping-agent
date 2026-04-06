@@ -1,13 +1,16 @@
 package main
 
 import (
+	"context"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/exec"
 	"strings"
 
 	"github.com/awandataindonesia/cekping-agent/internal/config"
+	"github.com/awandataindonesia/cekping-agent/internal/executor"
 	"github.com/awandataindonesia/cekping-agent/internal/worker"
 )
 
@@ -34,7 +37,23 @@ func main() {
 	server := flag.String("server", "localhost:50051", "Server Address (for install)")
 	secure := flag.Bool("secure", false, "Use secure connection (for install)")
 	logFile := flag.String("logfile", "", "Log file path (optional, default: stdout)")
+
+	// Local Testing Flags
+	pingTarget := flag.String("ping", "", "Run a local ping test against a target (IPv4 or IPv6)")
+	mtrTarget := flag.String("mtr", "", "Run a local MTR test against a target (IPv4 or IPv6)")
+	count := flag.Int("count", 4, "Number of packets/cycles for local test")
+
 	flag.Parse()
+
+	// Handle Local Testing
+	if *pingTarget != "" {
+		runLocalPing(*pingTarget, *count)
+		return
+	}
+	if *mtrTarget != "" {
+		runLocalMTR(*mtrTarget, *count)
+		return
+	}
 
 	// Setup logging to file if specified
 	if *logFile != "" {
@@ -60,6 +79,58 @@ func main() {
 
 	w := worker.NewWorker(cfg)
 	w.Start()
+}
+
+func runLocalPing(target string, count int) {
+	fmt.Printf("Pinging %s with %d packets...\n", target, count)
+	stats, err := executor.DoPing(context.Background(), target, count, func(seq, ttl int, rtt float64) {
+		if rtt > 0 {
+			fmt.Printf("%d bytes from %s: icmp_seq=%d time=%.2f ms\n", 64, target, seq, rtt)
+		} else {
+			fmt.Printf("Request timeout for icmp_seq %d\n", seq)
+		}
+	})
+
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return
+	}
+
+	fmt.Printf("\n--- %s ping statistics ---\n", target)
+	fmt.Printf("%d packets transmitted, %d packets received, %.1f%% packet loss\n",
+		count, len(stats.Rtts), stats.PacketLoss)
+	if len(stats.Rtts) > 0 {
+		fmt.Printf("round-trip min/avg/max/stddev = %.3f/%.3f/%.3f/%.3f ms\n",
+			stats.Min, stats.Avg, stats.Max, stats.StdDev)
+	}
+}
+
+func runLocalMTR(target string, count int) {
+	fmt.Printf("MTR to %s...\n", target)
+
+	// Collect latest stats for each hop
+	latestHops := make(map[int]executor.MTRHopStats)
+
+	err := executor.DoMTR(context.Background(), target, count, func(stats executor.MTRHopStats) {
+		latestHops[stats.Hop] = stats
+	})
+
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return
+	}
+
+	// Print final clean table
+	fmt.Printf("\n%-3s %-30s %-6s %-6s %-6s %-6s %-6s\n", "Hop", "Hostname/IP", "Loss%", "Last", "Avg", "Best", "Wrst")
+	for i := 1; i <= 30; i++ {
+		if h, ok := latestHops[i]; ok && h.IP != "" {
+			fmt.Printf("%-3d %-30s %-6.1f %-6.1f %-6.1f %-6.1f %-6.1f\n",
+				h.Hop, h.IP, h.Loss, h.Last, h.Avg, h.Best, h.Worst)
+			
+			// If we reached the target (IP matches target), we can stop printing further hops if we want, 
+			// but usually MTR shows all discovered hops.
+		}
+	}
 }
 
 func runInstall(token, server string, secure bool) {
